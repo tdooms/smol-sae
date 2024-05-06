@@ -98,7 +98,7 @@ class BaseSAE(nn.Module):
 
         scheduler = LambdaLR(self.optimizer, lr_lambda=lambda t: min(5*(1 - t/steps), 1.0))
 
-        for buffer, _ in tqdm(zip(sampler.sample(), range(self.config.n_buffers)), total=self.config.n_buffers):
+        for buffer, _ in tqdm(zip(sampler, range(self.config.n_buffers)), total=self.config.n_buffers):
             loader = DataLoader(buffer, batch_size=self.config.out_batch, shuffle=True, drop_last=True)
             for x in loader:
                 
