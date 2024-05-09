@@ -56,6 +56,12 @@ class BaseSAE(nn.Module):
     def encode(self, x):
         return x
     
+    def preprocess(self, x):
+        return x
+    
+    def postprocess(self, x):
+        return x
+    
     def forward(self, x):
         x_hid, *_ = self.encode(x)
         return self.decode(x_hid)
@@ -86,7 +92,7 @@ class BaseSAE(nn.Module):
             metrics[f"l0/{i}"] = (x_hid[..., i, :] > 0).float().sum(-1).mean().item()
         
         self.steps_not_active += 1
-        self.step += 1
+        
         
         return metrics
     
@@ -94,20 +100,24 @@ class BaseSAE(nn.Module):
         if log: wandb.init(project="sae")
         
         self.step = 0
-        steps = self.config.n_buffers * (self.config.buffer_size // self.config.out_batch)
+        self.steps = self.config.n_buffers * (self.config.buffer_size // self.config.out_batch)
 
-        scheduler = LambdaLR(self.optimizer, lr_lambda=lambda t: min(5*(1 - t/steps), 1.0))
+        scheduler = LambdaLR(self.optimizer, lr_lambda=lambda t: min(5*(1 - t/self.steps), 1.0))
 
         for buffer, _ in tqdm(zip(sampler, range(self.config.n_buffers)), total=self.config.n_buffers):
             loader = DataLoader(buffer, batch_size=self.config.out_batch, shuffle=True, drop_last=True)
             for x in loader:
                 
+                x = self.preprocess(x)
                 x = repeat(x, "... d -> ... inst d", inst=self.n_instances)
+                
                 x_hid, *rest = self.encode(x)
                 x_hat = self.decode(x_hid)
                 
-                losses = self.loss(x, x_hid, x_hat, self.step / steps, *rest)
-                metrics = self.calculate_metrics(x_hid, losses, self.step, *rest)
+                x = self.postprocess(x)
+                
+                losses = self.loss(x, x_hid, x_hat, *rest)
+                metrics = self.calculate_metrics(x_hid, losses, *rest)
 
                 loss = (losses.reconstruction + self.sparsities * losses.sparsity + losses.auxiliary).sum()
 
@@ -121,6 +131,7 @@ class BaseSAE(nn.Module):
                     metrics |= {f"patch_loss/{i}": (loss.item() - clean_loss) / clean_loss for i, loss in enumerate(losses)}
 
                 if log: wandb.log(metrics)
+                self.step += 1
         
         if log: wandb.finish()
                 
@@ -131,8 +142,11 @@ class BaseSAE(nn.Module):
 
         baseline, cache = model.run_with_cache(validation, return_type="loss", names_filter=[hook_pt])
         
-        x = repeat(cache[hook_pt], "... d -> ... inst d", inst=self.n_instances)
+        x = self.preprocess(cache[hook_pt])
+        x = repeat(x, "... d -> ... inst d", inst=self.n_instances)
         x_hat = self.forward(x)
+        
+        # TODO: if we implement postprocess properly, this can be used to validate transcoders, we'd need a second hook point though.
 
         # run model with recons patched in per instance
         for inst_id in range(self.n_instances):

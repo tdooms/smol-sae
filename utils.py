@@ -4,10 +4,10 @@ from torch.utils.data import DataLoader
 from einops import rearrange
 from transformer_lens import utils
 
-def get_splits(n_vals=32):
+def get_splits(n_validation=32):
     training = load_dataset("NeelNanda/c4-tokenized-2b", split="train", streaming=True).with_format("torch")
 
-    validation = list(training.take(n_vals))
+    validation = list(training.take(n_validation))
     validation = torch.stack([row["tokens"] for row in validation])
     
     return training, validation
@@ -69,3 +69,5 @@ class Sampler:
             
             if len(self.batches) == self.n_inputs:
                 yield self.collect()
+                torch.cuda.empty_cache() # just to be safe
+            
