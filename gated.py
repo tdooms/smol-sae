@@ -14,7 +14,7 @@ class GatedSAE(BaseSAE):
         device = config.device
 
         W_dec = torch.randn(self.n_instances, self.d_model, self.d_hidden, device=device)
-        W_dec /= torch.norm(W_dec, dim=-1, keepdim=True)
+        W_dec /= torch.norm(W_dec, dim=-2, keepdim=True)
         self.W_dec = nn.Parameter(W_dec)
 
         self.W_gate = nn.Parameter(W_dec.mT.clone().to(device))
