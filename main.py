@@ -3,28 +3,26 @@
 %autoreload 2
 
 from transformer_lens import HookedTransformer
-from einops import *
+import torch
 
 from base import Config
-from utils import get_splits, Sampler
-from anthropic import AnthropicSAE
+from utils import get_dataset_splits, TokenDataset
+from normed import NormedSAE
 from vanilla import VanillaSAE
-from gated import GatedSAE
-from rainbow import RainbowSAE
+from topk import TopkSAE
+from tokenized import TokenizedSAE
 
 # %%
-model = HookedTransformer.from_pretrained("gelu-1l").cuda()
-train, validation = get_splits()
+model = HookedTransformer.from_pretrained("gpt2").cuda()
+train, validation = get_dataset_splits(model.tokenizer, n_validation=16)
 # %%
 
-# This equates to about 65M tokens
-# This takes about 16 GB of GPU memory
-config = Config(n_buffers=50, expansion=4, buffer_size=2**17, sparsities=(0.1, 1.0))
-sampler = Sampler(config, train, model)
-sae = VanillaSAE(config, model).cuda()
+config = Config(point="resid_pre", layer=8, d_in=768, n_tokens=2**24, expansion=8, buffer_size=2**19, sparsity=30)
+ds = TokenDataset(config, model, train)
 
+# sae = TopkSAE(config).cuda()
+sae = TokenizedSAE(config, model).cuda()
 # %%
-# torch.backends.cudnn.benchmark = True
-sae.train(sampler, model, validation, log=True)
-
+torch.backends.cudnn.benchmark = True
+sae.train(ds, model, validation, log="sae")
 # %%

@@ -1,158 +1,175 @@
 from torch import nn
 import torch
 from transformer_lens import utils
-from dataclasses import dataclass
 from einops import *
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR
+from transformers import PreTrainedModel, PretrainedConfig
 import wandb
 from tqdm import tqdm
-from collections import namedtuple
+import gc
 
-Loss = namedtuple('Loss', ['reconstruction', 'sparsity', 'auxiliary'])
-
-@dataclass
-class Config:
-    buffer_size: int = 2**18  # ~250k tokens
-    n_buffers: int = 100      # ~25M tokens
+class Config(PretrainedConfig):
+    def __init__(
+        self,
+        point : str | None = None,
+        layer : int | None = None,
+        d_in: int | None = None,
+        n_ctx: int = 256,           # context window size to sample
+        n_tokens: int = 2**24,      # ~16M tokens
+        in_batch: int = 32,         # batch size for the transformer
+        out_batch: int = 4096,      # batch size for the SAE
+        buffer_size: int = 2**17,   # ~250k tokens
+        expansion: int = 16,        # SAE expansion factor
+        lr: float = 1e-4,
+        sparsity: float | int = 1.0,
+        validation_interval: int = 1000,
+        dead_thresh: int = 5,
+        device = "cuda",
+    ):
+        assert point is not None and layer is not None, "Must specify where to hook the SAE"
+        assert d_in is not None, "Must specify the input dimension SAE"
+        
+        self.point = point
+        self.layer = layer
+        
+        self.d_in = d_in
+        self.n_ctx = n_ctx
+        
+        self.buffer_size = buffer_size
+        self.n_tokens = n_tokens
+        self.in_batch = in_batch
+        self.out_batch = out_batch
+        
+        self.expansion = expansion
+        self.lr = lr
+        self.sparsity = sparsity
+        
+        self.validation_interval = validation_interval
+        self.inactive_thresh = dead_thresh
+        
+        self.hook_pt = utils.get_act_name(point, layer)
+        self.device = device
     
-    # transformer_lens specific
-    point : str = "resid_mid"
-    layer : int = 0
 
-    in_batch: int = 32
-    out_batch: int = 4096
-
-    expansion: int = 4
-    lr: float = 1e-4
-    
-    validation_interval: int = 1000
-    not_active_thresh: int = 2
-
-    sparsities: tuple = (0.01, 0.1, 1)
-    device = "cuda"
-
-class BaseSAE(nn.Module):
+class BaseSAE(PreTrainedModel):
     """
     Base class for all Sparse Auto Encoders.
     Provides a common interface for training and evaluation.
     """
-    def __init__(self, config, model) -> None:
-        super().__init__()
+    def __init__(self, config) -> None:
+        super().__init__(config)
         self.config = config
         
-        self.d_model = model.cfg.d_model
-        self.n_ctx = model.cfg.n_ctx
-        self.d_hidden = self.config.expansion * self.d_model
-        self.n_instances = len(config.sparsities)
+        # Set important parameters
+        self.n_ctx = config.n_ctx
+        self.d_in = config.d_in
+        self.d_hidden = self.config.expansion * self.d_in
         
-        self.steps_not_active = torch.zeros(self.n_instances, self.d_hidden)
-        self.sparsities = torch.tensor(config.sparsities).to(config.device)
-        self.step = 0
+        # Initialize the decoder and normalize the output dim
+        self.decoder = nn.Linear(self.d_hidden, self.d_in, bias=True)
+        self.decoder.weight.data /= torch.norm(self.decoder.weight.data, dim=-2, keepdim=True)
+        
+        # Initialize the encoder to the transpose
+        self.encoder = nn.Linear(self.d_in, self.d_hidden, bias=True)
+        self.encoder.weight.data = self.decoder.weight.data.T.clone()
+        
+        # Initialize add biases to zero
+        nn.init.zeros_(self.encoder.bias)
+        nn.init.zeros_(self.decoder.bias)
     
-    def decode(self, x):
-        return x
+    def forward(self, x, y=None):
+        return self.decode(self.encode(x), y)
+    
+    def decode(self, x, y=None):
+        return self.decoder(x)
     
     def encode(self, x):
-        return x
-    
-    def preprocess(self, x):
-        return x
-    
-    def postprocess(self, x):
-        return x
-    
-    def forward(self, x):
-        x_hid, *_ = self.encode(x)
-        return self.decode(x_hid)
-    
-    def loss(self, x, x_hid, x_hat, steps, *args):
-        pass
+        raise NotImplementedError
     
     @classmethod
-    def from_pretrained(cls, path, device='cpu', *args):
-        state = torch.load(path)
-        new = cls(*args)
-        return new.load_state_dict(state).to(device)
+    def from_pretrained(cls, path, device="cuda", **kwargs):
+        config = Config.from_pretrained(path)
+        return super(BaseSAE, BaseSAE).from_pretrained(path, config=config, device_map=device, **kwargs)
     
-    def calculate_metrics(self, x_hid, losses, *args):
-        activeness = x_hid.sum(0)
-        self.steps_not_active[activeness > 0] = 0
+    @classmethod
+    def from_config(cls, *args, **kwargs):
+        return BaseSAE(Config(*args, **kwargs))
+    
+    def loss(self, x, x_hid, x_hat, *args):
+        raise NotImplementedError
+    
+    def metrics(self, x, x_hid, x_hat, *args):
+        self.inactive[x_hid.sum(dim=0) > 0] = 0
+        self.inactive += 1
         
-        metrics = dict(step=self.step)
+        mse = (x - x_hat).pow(2).sum(-1)
         
-        for i in range(self.n_instances):
-            metrics[f"dead_fraction/{i}"] = (self.steps_not_active[i] > 2).float().mean().item()
-            
-            metrics[f"reconstruction_loss/{i}"] = losses.reconstruction[i].item()
-            metrics[f"sparsity_loss/{i}"] = losses.sparsity[i].item()
-            metrics[f"auxiliary_loss/{i}"] = losses.auxiliary[i].item()
-            
-            metrics[f"l1/{i}"] = x_hid[..., i, :].sum(-1).mean().item()
-            metrics[f"l0/{i}"] = (x_hid[..., i, :] > 0).float().sum(-1).mean().item()
-        
-        self.steps_not_active += 1
-        
+        metrics = {
+            "step": self.step,
+            "train/dead": (self.inactive > self.config.inactive_thresh).float().mean().item(),
+            "train/mse": mse.mean(),
+            "train/nmse": (mse / x.pow(2).sum(-1)).mean(),
+            "train/l1": x_hid.sum(dim=-1).mean().item(),
+            "train/l0": (x_hid > 0).float().sum(dim=-1).mean().item()
+        }
         
         return metrics
     
-    def train(self, sampler, model, validation, log=True):
-        if log: wandb.init(project="sae")
-        
+    def train(self, train, model, validation, log: str | None = "sae"):
+        if log is not None: wandb.init(project=log)
+
+        # Set (global) training variables
+        self.inactive = torch.zeros(self.d_hidden)
         self.step = 0
-        self.steps = self.config.n_buffers * (self.config.buffer_size // self.config.out_batch)
+        self.steps = self.config.n_tokens // self.config.out_batch
 
-        scheduler = LambdaLR(self.optimizer, lr_lambda=lambda t: min(5*(1 - t/self.steps), 1.0))
+        # scheduler = LambdaLR(self.optimizer, lr_lambda=lambda t: min(5*(1 - t/self.steps), 1.0))
+        scheduler = CosineAnnealingLR(self.optimizer, T_max=self.steps, eta_min=1e-5)
 
-        for buffer, _ in tqdm(zip(sampler, range(self.config.n_buffers)), total=self.config.n_buffers):
-            loader = DataLoader(buffer, batch_size=self.config.out_batch, shuffle=True, drop_last=True)
-            for x in loader:
-                
-                x = self.preprocess(x)
-                x = repeat(x, "... d -> ... inst d", inst=self.n_instances)
-                
-                x_hid, *rest = self.encode(x)
-                x_hat = self.decode(x_hid)
-                
-                x = self.postprocess(x)
-                
-                losses = self.loss(x, x_hid, x_hat, *rest)
-                metrics = self.calculate_metrics(x_hid, losses, *rest)
-
-                loss = (losses.reconstruction + self.sparsities * losses.sparsity + losses.auxiliary).sum()
-
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
-                scheduler.step()
-
-                if log and (self.step % self.config.validation_interval == 0):
-                    clean_loss, losses = self.patch_loss(model, validation)
-                    metrics |= {f"patch_loss/{i}": (loss.item() - clean_loss) / clean_loss for i, loss in enumerate(losses)}
-
-                if log: wandb.log(metrics)
-                self.step += 1
+        # Data loader & progress bar
+        loader = DataLoader(train, batch_size=self.config.out_batch, drop_last=True)
+        pbar = tqdm(loader, total=self.steps)
         
-        if log: wandb.finish()
-                
+        # Main training loop
+        for x, y in pbar:
+            x_hid = self.encode(x)
+            x_hat = self.decode(x_hid, y)
+
+            loss = self.loss(x, x_hid, x_hat)
+            metrics = self.metrics(x, x_hid, x_hat)
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            scheduler.step()
+
+            # Perform a validation step to check the final CE once in a while
+            if self.step % self.config.validation_interval == 0:
+                clean_loss, corrupt_loss, loss = self.patch_loss(model, validation)
+                metrics["val/ce_added"] = (loss.item() - clean_loss) / clean_loss
+                metrics["val/ce_recovered"] = 1 - (loss  - clean_loss) / (corrupt_loss - clean_loss)
+
+            pbar.set_description(f"NMSE: {metrics['train/nmse']:.4f}")
+            
+            if log is not None: wandb.log(metrics)
+            self.step += 1
+        
+        if log is not None: wandb.finish()
+
     @torch.inference_mode()
     def patch_loss(self, model, validation):
-        losses = torch.zeros(self.n_instances, device=self.config.device)
-        hook_pt = utils.get_act_name(self.config.point, self.config.layer)
-
-        baseline, cache = model.run_with_cache(validation, return_type="loss", names_filter=[hook_pt])
+        validation = validation["input_ids"][:, :self.config.n_ctx].to(self.config.device)
         
-        x = self.preprocess(cache[hook_pt])
-        x = repeat(x, "... d -> ... inst d", inst=self.n_instances)
-        x_hat = self.forward(x)
+        hook_pt = self.config.hook_pt
+        clean_loss, cache = model.run_with_cache(validation, return_type="loss", names_filter=[hook_pt])
         
-        # TODO: if we implement postprocess properly, this can be used to validate transcoders, we'd need a second hook point though.
-
-        # run model with recons patched in per instance
-        for inst_id in range(self.n_instances):
-            patch_hook = lambda act, hook: x_hat[:, :, inst_id]
-            loss = model.run_with_hooks(validation, return_type="loss", fwd_hooks = [(hook_pt, patch_hook)])
-            losses[inst_id] = loss.item()
-
-        return baseline, losses
+        corrupt_hook = lambda act, hook: torch.zeros_like(act)
+        corrupt_loss = model.run_with_hooks(validation, return_type="loss", fwd_hooks=[(hook_pt, corrupt_hook)])
+        
+        x_hat = self.forward(cache[hook_pt], validation)
+        patch_hook = lambda act, hook: x_hat
+        
+        loss = model.run_with_hooks(validation, return_type="loss", fwd_hooks=[(hook_pt, patch_hook)])
+        return clean_loss, corrupt_loss, loss
     
